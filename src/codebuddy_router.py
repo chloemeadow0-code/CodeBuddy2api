@@ -7,6 +7,7 @@ import time
 import uuid
 import logging
 import asyncio
+import threading
 from typing import Optional, Dict, Any, List, AsyncGenerator
 
 import httpx
@@ -58,7 +59,6 @@ class SecurityConfig:
     def get_ssl_verify() -> bool:
         """获取SSL验证设置 - 默认关闭，可通过环境变量启用"""
         import os
-        # 默认关闭SSL验证，只有明确设置为true时才启用
         ssl_verify_env = os.getenv("CODEBUDDY_SSL_VERIFY", "false").lower()
         ssl_verify = ssl_verify_env == "true"
         
@@ -83,7 +83,6 @@ async def get_http_client() -> httpx.AsyncClient:
     global _http_client_pool
     if _http_client_pool is None:
         async with _client_lock:
-            # 双重检查锁定模式 - 异步版本
             if _http_client_pool is None:
                 _http_client_pool = httpx.AsyncClient(**HTTP_CLIENT_CONFIG)
     return _http_client_pool
@@ -104,7 +103,6 @@ class AppLifecycleManager:
     async def startup():
         """应用启动时的初始化"""
         logger.info("CodeBuddy Router 启动中...")
-        # 预热连接池
         await get_http_client()
         logger.info("HTTP 连接池已初始化")
     
@@ -115,7 +113,6 @@ class AppLifecycleManager:
         await close_http_client()
         logger.info("资源清理完成")
 
-# 导出生命周期管理器供主应用使用
 lifecycle_manager = AppLifecycleManager()
 
 # --- 标准响应头 ---
@@ -144,7 +141,6 @@ class OpenAICompatibilityConverter:
 
     @staticmethod
     def _compact_delta(delta: Dict[str, Any]) -> Dict[str, Any]:
-        """压缩delta字段，移除空值，提升兼容性"""
         if not isinstance(delta, dict):
             return {}
 
@@ -163,7 +159,6 @@ class OpenAICompatibilityConverter:
 
     @staticmethod
     def normalize_openai_chunk(chunk_data: Dict[str, Any]) -> Dict[str, Any]:
-        """规范化OpenAI chunk，避免空字段导致下游解析异常"""
         if not isinstance(chunk_data, dict):
             return chunk_data
 
@@ -183,7 +178,6 @@ class OpenAICompatibilityConverter:
             if isinstance(delta, dict):
                 c["delta"] = OpenAICompatibilityConverter._compact_delta(delta)
 
-            # 非终止块的 finish_reason 规范为 null（而不是空字符串）
             if c.get("finish_reason", None) == "":
                 c["finish_reason"] = None
 
@@ -194,14 +188,12 @@ class OpenAICompatibilityConverter:
     
     @staticmethod
     def convert_tool_call_id(codebuddy_id: str) -> str:
-        """转换工具调用ID格式: tooluse_xxx -> call_xxx"""
         if codebuddy_id.startswith('tooluse_'):
             return f"call_{codebuddy_id[8:]}"
         return codebuddy_id
     
     @staticmethod
     def convert_sse_chunk_to_openai_format(chunk_data: Dict[str, Any], tool_call_index_map: Dict[str, int]) -> Dict[str, Any]:
-        """将CodeBuddy SSE块转换为OpenAI格式"""
         if not chunk_data.get('choices'):
             return OpenAICompatibilityConverter.normalize_openai_chunk(chunk_data)
         
@@ -212,38 +204,31 @@ class OpenAICompatibilityConverter:
         if not tool_calls:
             return OpenAICompatibilityConverter.normalize_openai_chunk(chunk_data)
         
-        # 转换工具调用格式
         converted_tool_calls = []
         for tc in tool_calls:
             converted_tc = tc.copy()
             
-            # 转换ID格式
             if tc.get('id'):
                 original_id = tc['id']
                 converted_id = OpenAICompatibilityConverter.convert_tool_call_id(original_id)
                 converted_tc['id'] = converted_id
                 
-                # 分配新的index
                 if original_id not in tool_call_index_map:
                     tool_call_index_map[original_id] = len(tool_call_index_map)
                 
                 converted_tc['index'] = tool_call_index_map[original_id]
             
-            # 如果没有ID，使用当前最新的index
             elif tool_call_index_map:
-                # 使用最后一个工具调用的index
                 converted_tc['index'] = max(tool_call_index_map.values())
             
             converted_tool_calls.append(converted_tc)
         
-        # 更新chunk数据
         converted_chunk = chunk_data.copy()
         converted_chunk['choices'][0]['delta']['tool_calls'] = converted_tool_calls
         
         return OpenAICompatibilityConverter.normalize_openai_chunk(converted_chunk)
 
 def parse_sse_line(line: str) -> Optional[Dict[str, Any]]:
-    """解析单行SSE数据"""
     if not line.startswith('data: '):
         return None
     
@@ -257,15 +242,12 @@ def parse_sse_line(line: str) -> Optional[Dict[str, Any]]:
         return None
 
 def validate_and_fix_tool_call_args(args: str) -> str:
-    """增强版的工具调用参数验证和修复 - 专门处理多工具调用问题"""
     if not args:
         return '{}'
     
     args = args.strip()
     
-    # 检查是否是多个JSON对象连接的情况 - 这是多工具调用的主要问题
     if args.count('}{') > 0:
-        # 尝试分离多个JSON对象
         json_objects = []
         current_obj = ""
         brace_count = 0
@@ -277,7 +259,6 @@ def validate_and_fix_tool_call_args(args: str) -> str:
             elif char == '}':
                 brace_count -= 1
                 if brace_count == 0 and current_obj.strip():
-                    # 完成了一个JSON对象
                     try:
                         parsed = json.loads(current_obj.strip())
                         json_objects.append(parsed)
@@ -288,25 +269,18 @@ def validate_and_fix_tool_call_args(args: str) -> str:
         if json_objects:
             return json.dumps(json_objects[0], ensure_ascii=False)
     
-    # 原有的修复逻辑
     try:
         json.loads(args)
         return args
     except json.JSONDecodeError as e:
-        
-        
-        # 尝试修复常见的JSON问题
         original_args = args
         if not args.endswith('}') and args.count('{') > args.count('}'):
             args += '}'
-            
         elif not args.endswith(']') and args.count('[') > args.count(']'):
             args += ']'
-            
         
         try:
             json.loads(args)
-            
             return args
         except json.JSONDecodeError:
             return '{}'
@@ -319,15 +293,14 @@ class SSEConnectionManager:
         self.retry_delay = retry_delay
     
     async def stream_with_retry(self, stream_func, *args, **kwargs):
-        """带重连的流式处理"""
         for attempt in range(self.max_retries + 1):
             try:
                 async for chunk in stream_func(*args, **kwargs):
                     yield chunk
-                break  # 成功完成，退出重试循环
+                break
             except (httpx.TimeoutException, httpx.NetworkError) as e:
                 if attempt < self.max_retries:
-                    wait_time = self.retry_delay * (2 ** attempt)  # 指数退避: 1s, 2s, 4s
+                    wait_time = self.retry_delay * (2 ** attempt)
                     logger.warning(f"连接失败，{wait_time}秒后重试 (第{attempt + 1}次): {e}")
                     yield format_sse_error(f"Connection lost, retrying in {wait_time}s... (attempt {attempt + 1})", "connection_retry")
                     await asyncio.sleep(wait_time)
@@ -337,13 +310,12 @@ class SSEConnectionManager:
                     yield format_sse_error(f"Connection failed after {self.max_retries} retries: {str(e)}", "connection_failed")
                     raise
             except Exception as e:
-                # 其他异常不重试，直接抛出
                 logger.error(f"流式处理异常: {e}")
                 yield format_sse_error(f"Stream error: {str(e)}", "stream_error")
                 raise
 
 class StreamResponseAggregator:
-    """流式响应聚合器 - 修复多工具调用问题：使用工具调用ID作为键"""
+    """流式响应聚合器"""
     
     def __init__(self):
         self.data = {
@@ -355,14 +327,11 @@ class StreamResponseAggregator:
             "usage": None,
             "system_fingerprint": None
         }
-        # 🔑 关键：使用工具调用ID作为键，因为index都是0会覆盖
-        self.tool_call_map = {}  # key: tool_call_id, value: tool_call_data
-        self.tool_call_order = []  # 保持工具调用的接收顺序
-        self.current_tool_id = None  # 当前正在处理的工具调用ID
+        self.tool_call_map = {}
+        self.tool_call_order = []
+        self.current_tool_id = None
     
     def process_chunk(self, obj: Dict[str, Any]):
-        """处理单个响应块"""
-        # 聚合基本信息
         self.data["id"] = self.data["id"] or obj.get('id')
         self.data["model"] = self.data["model"] or obj.get('model')
         self.data["system_fingerprint"] = obj.get('system_fingerprint') or self.data["system_fingerprint"]
@@ -380,22 +349,17 @@ class StreamResponseAggregator:
         
         delta = choice.get('delta', {})
         
-        # 聚合内容
         if delta.get('content'):
             self.data["content"] += delta.get('content')
         
-        # 处理工具调用
         if delta.get('tool_calls'):
             self._process_tool_calls(delta.get('tool_calls'))
     
     def _process_tool_calls(self, tool_calls: List[Dict[str, Any]]):
-        """处理工具调用 - 修复版：使用工具调用ID，正确处理分块传输"""
         for tc in tool_calls:
             tool_id = tc.get('id')
             
-            # 如果有ID，这是一个新的工具调用
             if tool_id:
-                # 新工具调用
                 if tool_id not in self.tool_call_map:
                     self.tool_call_map[tool_id] = {
                         'id': tool_id,
@@ -409,10 +373,8 @@ class StreamResponseAggregator:
                     self.current_tool_id = tool_id
                     logger.info(f"🔧 新工具调用: {tool_id}")
                 else:
-                    # 更新当前工具调用ID
                     self.current_tool_id = tool_id
                 
-                # 更新工具调用信息
                 if tc.get('type'):
                     self.tool_call_map[tool_id]['type'] = tc.get('type')
                 
@@ -422,27 +384,21 @@ class StreamResponseAggregator:
                 if func.get('arguments'):
                     self.tool_call_map[tool_id]['function']['arguments'] += func.get('arguments')
             
-            # 如果没有ID，但有当前工具调用ID，这是增量数据
             elif self.current_tool_id and self.current_tool_id in self.tool_call_map:
                 func = tc.get('function', {})
                 if func.get('name'):
                     self.tool_call_map[self.current_tool_id]['function']['name'] = func.get('name')
                 if func.get('arguments'):
                     self.tool_call_map[self.current_tool_id]['function']['arguments'] += func.get('arguments')
-            
             else:
-                # 没有ID且没有当前工具调用，跳过
                 logger.warning("⚠️ 工具调用缺少ID且无当前工具调用上下文，跳过处理")
     
     def finalize(self) -> Dict[str, Any]:
-        """完成聚合并返回最终响应"""
-        # 按接收顺序构建工具调用列表
         if self.tool_call_map:
             self.data["tool_calls"] = []
             for tool_id in self.tool_call_order:
                 if tool_id in self.tool_call_map:
                     tc = self.tool_call_map[tool_id]
-                    # 验证和修复工具调用参数
                     tc['function']['arguments'] = validate_and_fix_tool_call_args(
                         tc['function']['arguments']
                     )
@@ -451,7 +407,6 @@ class StreamResponseAggregator:
             
             logger.info(f"✅ 成功聚合 {len(self.data['tool_calls'])} 个工具调用")
         
-        # 构建最终响应
         final_message = {"role": "assistant", "content": self.data["content"]}
         if self.data["tool_calls"]:
             final_message["tool_calls"] = self.data["tool_calls"]
@@ -481,13 +436,12 @@ class StreamResponseAggregator:
         return final_response
 
 class CodeBuddyStreamService:
-    """CodeBuddy 流式服务类 - 职责分离，使用连接池优化"""
+    """CodeBuddy 流式服务类"""
     
     def __init__(self):
         self.connection_manager = SSEConnectionManager(max_retries=3, retry_delay=1.0)
     
     def _handle_api_error(self, status_code: int, error_msg: str) -> None:
-        """统一的API错误处理 - 直接抛出异常"""
         logger.error(f"CodeBuddy API错误: {status_code} - {error_msg}")
         
         if status_code == 401:
@@ -500,7 +454,6 @@ class CodeBuddyStreamService:
             raise HTTPException(status_code=status_code, detail=f"CodeBuddy API error: {error_msg}")
     
     async def handle_stream_response(self, payload: Dict[str, Any], headers: Dict[str, str]) -> StreamingResponse:
-        """处理流式响应 - 使用OpenAI兼容性转换器修复格式问题"""
         async def stream_core():
             client = await get_http_client()
             async with client.stream("POST", get_codebuddy_api_url(), json=payload, headers=headers) as response:
@@ -511,8 +464,7 @@ class CodeBuddyStreamService:
                     return
                 
                 buffer = ""
-                tool_call_index_map = {}  # 用于跟踪工具调用ID到index的映射
-                
+                tool_call_index_map = {}
                 
                 async for chunk in response.aiter_text(chunk_size=8192):
                     if not chunk:
@@ -520,36 +472,27 @@ class CodeBuddyStreamService:
                     
                     buffer += chunk
                     
-                    # 处理完整的SSE行
                     while '\n' in buffer:
                         line, buffer = buffer.split('\n', 1)
                         
-                        # 跳过空行和注释行
                         if not line.strip() or line.startswith(':'):
                             continue
                         
-                        # 检查是否结束
                         if '[DONE]' in line:
-                            # 标准SSE事件分隔：每个事件以空行结束
                             yield line + '\n\n'
                             return
                         
-                        # 解析SSE数据
                         chunk_data = parse_sse_line(line)
                         if chunk_data:
-                            # 🔑 关键修改：使用OpenAI兼容性转换器
                             converted_chunk = OpenAICompatibilityConverter.convert_sse_chunk_to_openai_format(
                                 chunk_data, tool_call_index_map
                             )
                             
-                            # 重新格式化为SSE格式并发送
                             converted_line = f"data: {json.dumps(converted_chunk, ensure_ascii=False)}"
                             yield converted_line + '\n\n'
                         else:
-                            # 非数据行直接转发
                             yield line + '\n\n'
                 
-                # 处理缓冲区中剩余的数据
                 if buffer.strip():
                     chunk_data = parse_sse_line(buffer.strip())
                     if chunk_data:
@@ -568,7 +511,6 @@ class CodeBuddyStreamService:
         return StreamingResponse(stream_with_retry(), media_type="text/event-stream", headers=SSE_HEADERS)
     
     async def handle_non_stream_response(self, payload: Dict[str, Any], headers: Dict[str, str]) -> Dict[str, Any]:
-        """处理非流式响应 - 使用修复后的聚合器，支持多工具调用"""
         try:
             client = await get_http_client()
             response = await client.post(get_codebuddy_api_url(), json=payload, headers=headers)
@@ -610,28 +552,24 @@ class CodeBuddyStreamService:
             raise HTTPException(status_code=500, detail=f"Request error: {str(e)}")
 
 class RequestProcessor:
-    """请求预处理器 - 线程安全的请求处理"""
+    """请求预处理器"""
     
     @staticmethod
     def prepare_payload(request_body: Dict[str, Any]) -> Dict[str, Any]:
-        """准备请求载荷"""
         payload = request_body.copy()
-        payload["stream"] = True  # CodeBuddy 只支持流式请求
+        payload["stream"] = True
 
-        # 模型名标准化：将常见别名映射为上游真实模型ID
         model = payload.get("model")
         if isinstance(model, str):
             mapped_model = MODEL_ALIASES.get(model.strip().lower())
             if mapped_model:
                 payload["model"] = mapped_model
         
-        # 处理消息长度要求：CodeBuddy要求至少2条消息
         messages = payload.get("messages", [])
         if len(messages) == 1 and messages[0].get("role") == "user":
             system_msg = {"role": "system", "content": "You are a helpful assistant."}
             payload["messages"] = [system_msg] + messages
         
-        # 应用关键词替换
         for msg in payload.get("messages", []):
             if msg.get("role") == "system":
                 msg["content"] = apply_keyword_replacement_to_system_message(msg.get("content"))
@@ -640,7 +578,6 @@ class RequestProcessor:
     
     @staticmethod
     def validate_request(request_body: Dict[str, Any]) -> None:
-        """验证请求参数"""
         if not isinstance(request_body, dict):
             raise HTTPException(status_code=400, detail="Request body must be a JSON object")
         
@@ -651,15 +588,95 @@ class RequestProcessor:
         if not messages:
             raise HTTPException(status_code=400, detail="At least one message is required")
         
-        # 验证消息格式
         for i, msg in enumerate(messages):
             if not isinstance(msg, dict):
                 raise HTTPException(status_code=400, detail=f"Message {i} must be an object")
             if "role" not in msg or "content" not in msg:
                 raise HTTPException(status_code=400, detail=f"Message {i} must have 'role' and 'content' fields")
 
+class APIKeyRotationManager:
+    """API Key 轮询管理器 - 支持多Key逗号分隔轮询"""
+    
+    _instance = None
+    _lock = threading.Lock()
+    
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            cls._instance._api_keys = []
+            cls._instance._current_index = 0
+            cls._instance._usage_count = 0
+            cls._instance._rotation_lock = threading.Lock()
+        return cls._instance
+    
+    def get_next_key(self) -> Optional[str]:
+        """获取下一个API Key，支持轮询"""
+        from config import get_codebuddy_api_key, get_rotation_count
+        
+        raw_key = get_codebuddy_api_key()
+        if not raw_key:
+            return None
+        
+        # 每次都重新解析，支持热更新
+        api_keys = [k.strip() for k in str(raw_key).split(",") if k.strip()]
+        
+        if not api_keys:
+            return None
+        
+        # 只有一个Key，不需要轮询
+        if len(api_keys) == 1:
+            return api_keys[0]
+        
+        # 多Key轮询
+        rotation_count = get_rotation_count()
+        if rotation_count <= 0:
+            rotation_count = 1
+        
+        with self._rotation_lock:
+            # 安全检查索引
+            if self._current_index >= len(api_keys):
+                self._current_index = 0
+                self._usage_count = 0
+            
+            # 检查是否需要轮换
+            if self._usage_count >= rotation_count:
+                self._current_index = (self._current_index + 1) % len(api_keys)
+                self._usage_count = 0
+                logger.info(f"🔄 API Key轮换: 切换到 #{self._current_index + 1}/{len(api_keys)}")
+            
+            selected_key = api_keys[self._current_index]
+            self._usage_count += 1
+            
+            logger.info(
+                f"🔑 使用 API Key #{self._current_index + 1}/{len(api_keys)} "
+                f"(使用次数: {self._usage_count}/{rotation_count})"
+            )
+            
+            return selected_key
+    
+    def get_status(self) -> Dict[str, Any]:
+        """获取当前轮询状态"""
+        from config import get_codebuddy_api_key, get_rotation_count
+        
+        raw_key = get_codebuddy_api_key()
+        api_keys = [k.strip() for k in str(raw_key).split(",") if k.strip()] if raw_key else []
+        rotation_count = get_rotation_count()
+        
+        return {
+            "total_keys": len(api_keys),
+            "current_index": self._current_index + 1 if api_keys else 0,
+            "usage_count": self._usage_count,
+            "rotation_count": rotation_count,
+            "auto_rotation": len(api_keys) > 1
+        }
+
+
+# 全局实例
+api_key_rotation_manager = APIKeyRotationManager()
+
+
 class CredentialManager:
-    """认证信息管理器 - 支持 API Key 和 Token 两种模式"""
+    """认证信息管理器 - 支持 API Key（多Key轮询）和 Token 两种模式"""
     
     @staticmethod
     def get_auth_context() -> Dict[str, Any]:
@@ -678,9 +695,15 @@ class CredentialManager:
             if auth_mode == "api_key" or (auth_mode == "auto" and api_key):
                 if not api_key:
                     raise HTTPException(status_code=401, detail="API Key mode enabled but CODEBUDDY_API_KEY is empty")
+                
+                # 使用轮询管理器获取下一个Key
+                selected_key = api_key_rotation_manager.get_next_key()
+                if not selected_key:
+                    raise HTTPException(status_code=401, detail="没有可用的API Key")
+                
                 return {
                     "type": "api_key",
-                    "api_key": api_key,
+                    "api_key": selected_key,
                     "user_id": "anonymous"
                 }
 
@@ -715,22 +738,18 @@ async def chat_completions(
     x_request_id: Optional[str] = Header(None, alias="X-Request-ID"),
     _token: str = Depends(authenticate)
 ):
-    """CodeBuddy V1 聊天完成API - 重构后的简洁版本"""
+    """CodeBuddy V1 聊天完成API"""
     try:
-        # 解析和验证请求体
         try:
             request_body = await request.json()
         except Exception as e:
             logger.error(f"解析请求体失败: {e}")
             raise HTTPException(status_code=400, detail=f"Invalid JSON request body: {str(e)}")
         
-        # 验证请求参数
         RequestProcessor.validate_request(request_body)
         
-        # 获取认证信息（API Key 或 Token）
         auth_context = CredentialManager.get_auth_context()
         
-        # 生成请求头
         headers = codebuddy_api_client.generate_codebuddy_headers(
             auth=auth_context,
             user_id=auth_context.get('user_id'),
@@ -740,11 +759,9 @@ async def chat_completions(
             request_id=x_request_id
         )
         
-        # 预处理请求
         payload = RequestProcessor.prepare_payload(request_body)
         usage_stats_manager.record_model_usage(payload.get("model", "unknown"))
         
-        # 使用服务类处理请求
         service = CodeBuddyStreamService()
         client_wants_stream = request_body.get("stream", False)
         
@@ -789,7 +806,6 @@ async def list_credentials(_token: str = Depends(authenticate)):
         for info in credentials_info:
             bearer_token = credentials[info['index']].get("bearer_token", "") if info['index'] < len(credentials) else ""
             
-            # 格式化时间显示
             if info['time_remaining'] is not None and info['time_remaining'] > 0:
                 days, remainder = divmod(info['time_remaining'], 86400)
                 hours, remainder = divmod(remainder, 3600)
@@ -799,7 +815,7 @@ async def list_credentials(_token: str = Depends(authenticate)):
                 time_remaining_str = "Expired" if info['time_remaining'] is not None else "Unknown"
             
             safe_credentials.append({
-                **info,  # 展开所有原始信息
+                **info,
                 "time_remaining_str": time_remaining_str,
                 "has_token": bool(bearer_token),
                 "token_preview": f"{bearer_token[:10]}...{bearer_token[-4:]}" if len(bearer_token) > 14 else "Invalid Token"
@@ -893,6 +909,14 @@ async def toggle_auto_rotation(_token: str = Depends(authenticate)):
 async def get_current_credential(_token: str = Depends(authenticate)):
     """获取当前使用的凭证信息"""
     try:
+        # 优先返回API Key轮询状态（如果在使用API Key模式）
+        from config import get_codebuddy_auth_mode, get_codebuddy_api_key
+        auth_mode = (get_codebuddy_auth_mode() or "auto").strip().lower()
+        api_key = get_codebuddy_api_key()
+        
+        if auth_mode == "api_key" or (auth_mode == "auto" and api_key):
+            return api_key_rotation_manager.get_status()
+        
         info = codebuddy_token_manager.get_current_credential_info()
         return info
 
